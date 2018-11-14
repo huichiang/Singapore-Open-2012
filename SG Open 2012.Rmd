@@ -1,0 +1,568 @@
+---
+title: "Predicting Singapore Open Masters Scores"
+author: "Hui Chiang"
+output:
+  html_document: default
+  #pdf_document: default
+---
+##Introduction
+In this project, I want to look at whether we can predict a bowler's Masters Final score based on their MQ scores, and other factors such as sex and category. The data set we will be looking at specifically is the 2012 Singapore Open (because it was the last one I participated in heh), and the U18, Youth (U21) and Open categories for both sexes.
+
+##Extracting the Data
+Let's first take a look at the ABF website (2012) where I obtained the scores from.
+
+![Fig 1.1: U18 MQ Scores](/Users/tayhuichiang94/Desktop/personal project/SG_Open_2012/u18.png){width=300px} ![Fig 1.2: U18 Masters Scores](/Users/tayhuichiang94/Desktop/personal project/SG_Open_2012/u18masters.png){width=300px} 
+
+We want to extract the names, country, series 1 and 2 (mq1, mq2) and high game of the 16 qualifiers in Figure 1.1, after which we can easily obtain the average. We also want to extract the finals scores of the 16 qualifiers in Figure 1.2.
+
+We do this by using regular expressions (regex) to scrape the required information from the html source code of the webpage. Regex is a way for us to search the large html file for certain strings that match our desired pattern (Goyvaerts, 2018). 
+
+After extraction, we have a dataframe for the MQ scores,
+```{r echo=FALSE}
+library(stringr)
+library(boot)
+library(ggplot2)
+library(gridExtra)
+library(glmnet)
+set.seed(1)
+
+MU182012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=BU18')
+MU182012MQraw <- MU182012MQraw[199:230]
+MU182012MQraw <- MU182012MQraw[seq(1,32,2)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MU182012MQraw, gregexpr(nameex, MU182012MQraw)))
+names <- str_sub(names, 7,-2)
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(MU182012MQraw, gregexpr(mqex, MU182012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,48,3)])
+mq2 <- as.numeric(mq[seq(2,48,3)])
+hg <- as.numeric(mq[seq(3,48,3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(MU182012MQraw, gregexpr(countryex, MU182012MQraw)))
+country <- substr(country, 2, 4)
+MU182012MQ <- data.frame(names,country,mq1,mq2,hg)
+MU182012MQ$average <- ((MU182012MQ$mq1 + MU182012MQ$mq2)/6.0)
+head(MU182012MQ)
+```
+
+and one for the Masters scores,
+```{r echo=FALSE}
+#Import the html file
+MU182012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=BU18')
+
+#Obtain lines which contain our data
+first <- grep('JAVIER TAN', MU182012Mastersraw, useBytes = TRUE)
+last <- grep('MARCUS CHAN', MU182012Mastersraw, useBytes = TRUE)
+
+#Extract data
+MU182012Mastersraw <- MU182012Mastersraw[201:231]
+MU182012Mastersraw <- MU182012Mastersraw[seq(1,31,2)]
+
+#Obtain scores in the format 205.23 etc
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(MU182012Mastersraw, gregexpr(scoreex, MU182012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+
+#Obtain names
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MU182012Mastersraw, gregexpr(nameex, MU182012Mastersraw)))
+names <- str_sub(names, 7,-2)
+
+#Combine data into data frame
+MU182012Masters <- data.frame(names,score)
+head(MU182012Masters)
+```
+
+We now wish to perform an inner join to merge the 2 dataframes on the names of the bowlers, such that we can obtain a single dataframe which contains both te MQ and the Masters scores for each bowler.
+```{r}
+MU182012 <- merge(MU182012MQ, MU182012Masters, 'names')
+dim(MU182012)
+```
+
+When we check the dimensions of the dataframe, we see that there are only 15 bowlers, instead of 16. This could be because one name was keyed in differently on the different webpages. Checking for differences in names,
+```{r echo=FALSE}
+MU182012Masters$names <- as.character(MU182012Masters$names)
+MU182012MQ$names <- as.character(MU182012MQ$names)
+correct <- MU182012MQ$names[!(MU182012MQ$names %in% MU182012Masters$names)]
+incorrect <- MU182012Masters$names[!(MU182012Masters$names %in% MU182012MQ$names)]
+correct
+incorrect
+```
+
+Indeed, we find that there is a name that has been keyed in differently. We correct this and merge the dataframes again.
+```{r, echo=FALSE}
+for (i in 1:length(incorrect)){
+  MU182012Masters$names[MU182012Masters$names == incorrect[i]] <- correct[i]
+}
+MU182012 <- merge(MU182012MQ, MU182012Masters, 'names')
+```
+
+Finally, since we will also be looking at scores from other categories and sexes, we add the 'category' and 'sex' columns. Our final dataframe for the Boys U18 division looks like this,
+```{r echo=FALSE}
+MU182012$category <- 'U18'
+MU182012$sex <- 'Male'
+head(MU182012)
+```
+
+We extract the data for the other categories in the same way. We then do a left join on each dataframe to create an overall dataframe for the 6 different categories (3 categories for 2 sexes). 
+
+Also do note that for the Open category, we do not consider the Desperado and Defending Champion because they may not have a corresponding MQ score, and that we will use their Round 1 Finals score for analysis.
+```{r, echo=FALSE}
+#Scrape Boys U21 MQ scores
+MU212012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=BO')
+first <- grep('NG KAI XIANG', MU212012MQraw, useBytes = TRUE)
+last <- grep('Reserves', MU212012MQraw, useBytes = TRUE)
+MU212012MQraw <- MU212012MQraw[199:246]
+MU212012MQraw <- MU212012MQraw[seq(1,48,2)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MU212012MQraw, gregexpr(nameex, MU212012MQraw)))
+names <- str_sub(names, 7,-2)
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(MU212012MQraw, gregexpr(mqex, MU212012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,72,3)])
+mq2 <- as.numeric(mq[seq(2,72,3)])
+hg <- as.numeric(mq[seq(3,72,3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(MU212012MQraw, gregexpr(countryex, MU212012MQraw)))
+country <- substr(country, 2, 4)
+MU212012MQ <- data.frame(names,country,mq1,mq2,hg)
+MU212012MQ$average <- ((MU212012MQ$mq1 + MU212012MQ$mq2)/6.0)
+
+#Scrape final scores
+MU212012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=BO')
+first <- grep('JAVIER TAN', MU212012Mastersraw, useBytes = TRUE)
+last <- grep('ANDRIY HURWOOD', MU212012Mastersraw, useBytes = TRUE)
+MU212012Mastersraw <- MU212012Mastersraw[first:last]
+MU212012Mastersraw <- MU212012Mastersraw[seq(1,48,2)]
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(MU212012Mastersraw, gregexpr(scoreex, MU212012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MU212012Mastersraw, gregexpr(nameex, MU212012Mastersraw)))
+names <- str_sub(names, 7,-2)
+MU212012Masters <- data.frame(names,score)
+MU212012Masters$names <- as.character(MU212012Masters$names)
+MU212012MQ$names <- as.character(MU212012MQ$names)
+correct <- MU212012MQ$names[!(MU212012MQ$names %in% MU212012Masters$names)]
+incorrect <- MU212012Masters$names[!(MU212012Masters$names %in% MU212012MQ$names)]
+for (i in 1:length(incorrect)){
+  MU212012Masters$names[MU212012Masters$names == incorrect[i]] <- correct[i]
+}
+MU212012 <- merge(MU212012MQ, MU212012Masters, 'names')
+MU212012$category <- 'U21'
+MU212012$sex <- 'Male'
+
+#Scrape Men's Open MQ scores
+MO2012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=MO')
+first <- grep('Local Pool', MO2012MQraw, useBytes = TRUE)
+last <- grep('Desperado', MO2012MQraw, useBytes = TRUE)
+MO2012MQraw <- MO2012MQraw[205:287]
+MO2012MQraw <- MO2012MQraw[grep('[>][A-Z]{3}[<]', MO2012MQraw)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MO2012MQraw, gregexpr(nameex, MO2012MQraw)))
+names <- str_sub(names, 7,-2)
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(MO2012MQraw, gregexpr(mqex, MO2012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,114,3)])
+mq2 <- as.numeric(mq[seq(2,114,3)])
+hg <- as.numeric(mq[seq(3,114,3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(MO2012MQraw, gregexpr(countryex, MO2012MQraw)))
+country <- substr(country, 2, 4)
+MO2012MQ <- data.frame(names,country,mq1,mq2,hg)
+MO2012MQ$average <- ((MO2012MQ$mq1 + MO2012MQ$mq2)/6.0)
+
+#Scrape final scores
+MO2012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=MO')
+first <- grep('DEREK CHAN', MO2012Mastersraw, useBytes = TRUE)
+last <- grep('YUSUF BIN ABDUL RAOF', MO2012Mastersraw, useBytes = TRUE)
+MO2012Mastersraw <- MO2012Mastersraw[first:last]
+MO2012Mastersraw <- MO2012Mastersraw[seq(1,83,2)]
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(MO2012Mastersraw, gregexpr(scoreex, MO2012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(MO2012Mastersraw, gregexpr(nameex, MO2012Mastersraw)))
+names <- str_sub(names, 7,-2)
+MO2012Masters <- data.frame(names,score)
+
+#Ensuring the names are the same and removing the Defending Champion and Desperado qualifiers
+MO2012Masters$names <- as.character(MO2012Masters$names)
+MO2012MQ$names <- as.character(MO2012MQ$names)
+correct <- sort(MO2012MQ$names[!(MO2012MQ$names %in% MO2012Masters$names)])
+incorrect <- sort(MO2012Masters$names[!(MO2012Masters$names %in% MO2012MQ$names)])
+incorrect <- incorrect[-c(1,2,7,15)]
+incorrect[10:11] <- c(incorrect[11], incorrect[10])
+for (i in 1:length(incorrect)){
+  MO2012Masters$names[MO2012Masters$names == incorrect[i]] <- correct[i]
+}
+MO2012 <- merge(MO2012MQ, MO2012Masters, 'names')
+MO2012$category <- 'Open'
+MO2012$sex <- 'Male'
+
+#Female scores
+FU182012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=GU18')
+first <- grep('TAY HUI WEN', FU182012MQraw, useBytes = TRUE)
+last <- grep('Reserves', FU182012MQraw, useBytes = TRUE)
+FU182012MQraw <- FU182012MQraw[first:last]
+FU182012MQraw <- FU182012MQraw[seq(1,last-1,2)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FU182012MQraw, gregexpr(nameex, FU182012MQraw)))
+names <- str_sub(names, 7,-2)
+names <- names[1:8]
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(FU182012MQraw, gregexpr(mqex, FU182012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,length(mq),3)])
+mq2 <- as.numeric(mq[seq(2,length(mq),3)])
+hg <- as.numeric(mq[seq(3,length(mq),3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(FU182012MQraw, gregexpr(countryex, FU182012MQraw)))
+country <- substr(country, 2, 4)
+FU182012MQ <- data.frame(names,country,mq1,mq2,hg)
+FU182012MQ$average <- ((FU182012MQ$mq1 + FU182012MQ$mq2)/6.0)
+
+#Scrape final scores
+FU182012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=GU18')
+first <- grep('MICHELLE NG', FU182012Mastersraw, useBytes = TRUE)
+last <- grep('DAPHNE AW', FU182012Mastersraw, useBytes = TRUE)
+FU182012Mastersraw <- FU182012Mastersraw[first:last]
+FU182012Mastersraw <- FU182012Mastersraw[seq(1,last-1,2)]
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(FU182012Mastersraw, gregexpr(scoreex, FU182012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FU182012Mastersraw, gregexpr(nameex, FU182012Mastersraw)))
+names <- str_sub(names, 7,-2)
+FU182012Masters <- data.frame(names,score)
+FU182012Masters$names <- as.character(FU182012Masters$names)
+FU182012MQ$names <- as.character(FU182012MQ$names)
+
+#Correct the names and merge
+correct <- sort(FU182012MQ$names[!(FU182012MQ$names %in% FU182012Masters$names)])
+incorrect <- sort(FU182012Masters$names[!(FU182012Masters$names %in% FU182012MQ$names)])
+for (i in 1:length(incorrect)){
+  FU182012Masters$names[FU182012Masters$names == incorrect[i]] <- correct[i]
+}
+FU182012 <- merge(FU182012MQ, FU182012Masters, 'names')
+
+#Female Under 21 MQ
+FU212012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=GO')
+first <- grep('DAPHNE AW', FU212012MQraw, useBytes = TRUE)
+last <- grep('Reserves', FU212012MQraw, useBytes = TRUE)
+FU212012MQraw <- FU212012MQraw[first:last]
+FU212012MQraw <- FU212012MQraw[seq(1,last-1,2)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FU212012MQraw, gregexpr(nameex, FU212012MQraw)))
+names <- str_sub(names, 7,-2)
+names <- names[1:12]
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(FU212012MQraw, gregexpr(mqex, FU212012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,length(mq),3)])
+mq2 <- as.numeric(mq[seq(2,length(mq),3)])
+hg <- as.numeric(mq[seq(3,length(mq),3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(FU212012MQraw, gregexpr(countryex, FU212012MQraw)))
+country <- substr(country, 2, 4)
+FU212012MQ <- data.frame(names,country,mq1,mq2,hg)
+FU212012MQ$average <- ((FU212012MQ$mq1 + FU212012MQ$mq2)/6.0)
+
+#Female U21 Masters
+FU212012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=GO')
+first <- grep('JOEY YEO RUOQI', FU212012Mastersraw, useBytes = TRUE)
+last <- grep('JOY YAP JING YING', FU212012Mastersraw, useBytes = TRUE)
+FU212012Mastersraw <- FU212012Mastersraw[first:last]
+FU212012Mastersraw <- FU212012Mastersraw[seq(1,last-1,2)]
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(FU212012Mastersraw, gregexpr(scoreex, FU212012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FU212012Mastersraw, gregexpr(nameex, FU212012Mastersraw)))
+names <- str_sub(names, 7,-2)
+FU212012Masters <- data.frame(names,score)
+FU212012Masters$names <- as.character(FU212012Masters$names)
+FU212012MQ$names <- as.character(FU212012MQ$names)
+
+#Correct the names and merge
+correct <- sort(FU212012MQ$names[!(FU212012MQ$names %in% FU212012Masters$names)])
+incorrect <- sort(FU212012Masters$names[!(FU212012Masters$names %in% FU212012MQ$names)])
+for (i in 1:length(incorrect)){
+  FU212012Masters$names[FU212012Masters$names == incorrect[i]] <- correct[i]
+}
+FU212012 <- merge(FU212012MQ, FU212012Masters, 'names')
+
+#Female Open MQ
+FO2012MQraw <- readLines('http://www.abf-online.org/results/2012/45thspore-1.asp?Division=WO')
+first <- grep('Local Pool', FO2012MQraw, useBytes = TRUE)
+last <- grep('Reserves', FO2012MQraw, useBytes = TRUE)
+FO2012MQraw <- FO2012MQraw[first:last-1]
+FO2012MQraw <- FO2012MQraw[grep('[>][A-Z]{3}[<]', FO2012MQraw)]
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FO2012MQraw, gregexpr(nameex, FO2012MQraw)))
+names <- str_sub(names, 7,-2)
+mqex <- '[>][0-9]{3}[<]'
+mq <- unlist(regmatches(FO2012MQraw, gregexpr(mqex, FO2012MQraw)))
+mq <- str_sub(mq, 2, 4)
+mq1 <- as.numeric(mq[seq(1,length(mq),3)])
+mq2 <- as.numeric(mq[seq(2,length(mq),3)])
+hg <- as.numeric(mq[seq(3,length(mq),3)])
+countryex <- '[>][A-Z]{3}[<]'
+country <- unlist(regmatches(FO2012MQraw, gregexpr(countryex, FO2012MQraw)))
+country <- substr(country, 2, 4)
+FO2012MQ <- data.frame(names,country,mq1,mq2,hg)
+FO2012MQ$average <- ((FO2012MQ$mq1 + FO2012MQ$mq2)/6.0)
+
+#Scrape Female Open Masters
+FO2012Mastersraw <- readLines('http://www.abf-online.org/results/2012/45thspore-2.asp?Division=WO')
+first <- grep('JUNG DA-WUN', FO2012Mastersraw, useBytes = TRUE)
+last <- grep('YAP SEOK KIM', FO2012Mastersraw, useBytes = TRUE)
+FO2012Mastersraw <- FO2012Mastersraw[first:last]
+FO2012Mastersraw <- FO2012Mastersraw[seq(1,last-1,2)]
+scoreex <- '[>][0-9]{3}[.][0-9]{2}[<]'
+score <- unlist(regmatches(FO2012Mastersraw, gregexpr(scoreex, FO2012Mastersraw)))
+score <- as.numeric(str_sub(score, 2, 7))
+nameex <- '[&].*?[<]'
+names <- unlist(regmatches(FO2012Mastersraw, gregexpr(nameex, FO2012Mastersraw)))
+names <- str_sub(names, 7,-2)
+FO2012Masters <- data.frame(names,score)
+
+#Ensure names are correct and remove defending champion
+FO2012Masters$names <- as.character(FO2012Masters$names)
+FO2012MQ$names <- as.character(FO2012MQ$names)
+correct <- sort(FO2012MQ$names[!(FO2012MQ$names %in% FO2012Masters$names)])
+incorrect <- sort(FO2012Masters$names[!(FO2012Masters$names %in% FO2012MQ$names)])
+incorrect <- incorrect[-2]
+for (i in 1:length(incorrect)){
+  FO2012Masters$names[FO2012Masters$names == incorrect[i]] <- correct[i]
+}
+FO2012 <- merge(FO2012MQ, FO2012Masters, 'names')
+
+#Merge all the dataframes into a single combined dataframe
+Combined2012 <- merge(MU182012, MU212012, all=TRUE)
+Combined2012 <- merge(Combined2012, MO2012, all=TRUE)
+FO2012$category <- 'Open'
+Combined2012 <- merge(Combined2012, FO2012, all=TRUE)
+FU182012$category <- 'U18'
+Combined2012 <- merge(Combined2012, FU182012, all=TRUE)
+FU212012$category <- 'U21'
+Combined2012 <- merge(Combined2012, FU212012, all=TRUE)
+levels(Combined2012$sex) <- c('Male', 'Female')
+Combined2012$sex[is.na(Combined2012$sex)] <- 'Female'
+Combined2012$category <- as.factor(Combined2012$category)
+Combined2012$sex <- as.factor(Combined2012$sex)
+```
+
+Taking a look at a summary of our dataframe,
+```{r, echo=FALSE}
+summary(Combined2012)
+```
+
+We see that the most bowlers are from 3 countries, Singapore, Malaysia and Korea. We will group the other countries into 'Others' to avoid possible problems with cross-validation.
+```{r, echo=FALSE}
+Combined2012$country <- as.character(Combined2012$country)
+Combined2012$country <- ifelse(Combined2012$country != 'SIN' & Combined2012$country != 'MAS' & Combined2012$country != 'KOR', 'Others', Combined2012$country)
+Combined2012$country <- as.factor(Combined2012$country)
+Combined2012$country <- factor(Combined2012$country, levels = c('SIN','MAS','KOR','Others'))
+Combined2012$category <- factor(Combined2012$category, levels = c('Open','U21','U18'))
+```
+
+##Exploratory Data Analysis
+Let's look at some possible trends within the data.
+```{r, echo=FALSE}
+pairs(~mq1+mq2+hg, data=Combined2012)
+```
+
+We see that our continuous variables, mq1, mq2, and hg all seem to be positively correlated with each other. We do expect a bowler's high game to have a strong positive correlation with the mq scores.
+
+```{r, echo=FALSE, fig.width = 6}
+line.fit <- coef((lm(Combined2012$score~Combined2012$average)))
+
+plot1 <- ggplot(data=Combined2012) + 
+  theme(legend.position = 'bottom') +
+  geom_point(mapping = aes(x = average, y = score, col = sex)) +
+  labs(x = 'MQ Average', y = 'Masters Score') +
+  geom_abline(intercept = line.fit[1], slope = line.fit[2], color = 'skyblue3')
+
+plot2 <- ggplot(data=Combined2012) + 
+  theme(legend.position = 'bottom') +
+  geom_point(mapping = aes(x = average, y = score, col = category)) +
+  labs(x = 'MQ Average', y = 'Masters Score') +
+  geom_abline(intercept = line.fit[1], slope = line.fit[2], color = 'skyblue3')
+
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+From the above two figures, we see that while average is positively correlated with finals score, this could be due to the effect of the differences in score arising from the different categories and sexes.
+
+Lastly, we would like to take a look at the performance of each country in the Open category,
+```{r, echo=FALSE, fig.width = 6}
+plot1 <- ggplot(data=Combined2012[Combined2012$category=='Open',], 
+                aes(x=country, y=score)) + 
+  geom_boxplot() +
+  labs(x = 'Country', y = 'Masters Score') 
+
+plot2 <- ggplot(data=Combined2012[Combined2012$category=='Open',],
+                aes(x=country, y=average)) + 
+  geom_boxplot() +
+  labs(x = 'Country', y = 'MQ Average') 
+
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+In the Masters Final, Korean bowlers bowled better on average than all the other countries, although Singaporean bowlers exhibited the largest variance. As for the MQ scores, Korean MQs were only slightly higher on average than the others, while Singaporean MQ scores were the lowest, possibly due to the presence of a 'Local Pool'.
+
+##Linear Regression
+Linear regression is an approach used to model the relatioship between a continuous variable (in our case Masters Score) with other independent, predictor variables (mq scores, country etc). Intuititvely, we are trying to find a line of best-fit, such as the one in the figure below.
+```{r, fig.width=4, echo=FALSE}
+X <- runif(50,0,5)
+Y <- 1 + X + rnorm(50,0,1)
+plot(X,Y)
+abline(coef(lm(Y~X))[1], coef(lm(Y~X))[2])
+```
+
+Linear regression assumes a linear relationship between the variables. Say we have $n$ data points and $p$ predictors, then we form the relationship $Y_{i} = \beta_{0}+\beta_{1}X_{i1}+\dots+\beta_{p}X_{ip}+\epsilon+{i}$ where $i=1\dots n$. In this equation, the $\beta$ represent the coefficients which we want to estimate, and $\epsilon$ is a random error term. 
+
+We use a matrix representation for our data, $\mathbf{Y} = \mathbf{X}\boldsymbol{\beta}+\boldsymbol{\epsilon}$ where $\mathbf{Y} =\begin{pmatrix}Y_{1}\\ \vdots \\ Y_{n}\end{pmatrix}$, $\mathbf{X}=\begin{pmatrix}1 & X_{11} & \dots & X_{1p} \\ \vdots \\ 1 & X_{n1} & \dots & X_{np}\end{pmatrix}$, $\boldsymbol{\beta} = \begin{pmatrix}\beta_{1}\\ \vdots \\ \beta_{p} \end{pmatrix}$ and $\boldsymbol{\epsilon} = \begin{pmatrix}\epsilon_{1}\\ \vdots \\ \epsilon_{n} \end{pmatrix}$.
+
+We estimate $\boldsymbol{\beta}$ by minimising mean squared error, $MSE=\frac{1}{n}\left(\mathbf{Y}-\mathbf{X}\boldsymbol{\widehat{\beta}}\right)^{T}\left(\mathbf{Y}-\mathbf{X}\boldsymbol{\widehat{\beta}}\right)$, where $\boldsymbol{\widehat{\beta}}$ is a quantity we estimate. This gives us the solution $\boldsymbol{\widehat{\beta}}=\left(\mathbf{X^{T}X}\right)^{-1}\mathbf{X}^{T}\mathbf{Y}$. We can then use $\boldsymbol{\widehat{\beta}}$ to predict the Masters scores given the predictor variables.
+
+We will test our model using cross-validation. The idea behind cross-validation is that we first randomly divide our data into $k$ different groups, each with approximately the same number of entries. We leave out one group as the test set, and use the rest of the entries in the other $k-1$ groups to train our model. Then, we test the performance of the model on the test set to obtain the mean squared error for that set. We repeat this process $k$ times to find the cross-validation error, $\frac{1}{k}\sum_{i=1}^{k}MSE_{i}$.
+
+Now, let's try it out!
+```{r}
+#We use 10 fold cross-validation here, which means we set k=10
+#Creating the linear model
+mylm <- glm(score~mq1+mq2+hg+country+sex+category, data=Combined2012)
+mycv <- cv.glm(Combined2012, mylm, K=10)
+mycv$delta[1]
+```
+
+We obtain a mean squared error of around 147, that is huge! It does not bode well in our attempt to predict Masters scores.
+
+##Ridge Regression
+Ridge regression is similar to linear regression, except that we introduce an additional term to penalise the coefficients if they get too large. In matrix form, we now wish to minimise $\left(\mathbf{Y}-\mathbf{X}\boldsymbol{\widehat{\beta}}\right)^{T}\left(\mathbf{Y}-\mathbf{X}\boldsymbol{\widehat{\beta}}\right)+\lambda\boldsymbol{\widehat{\beta}}^{T}\boldsymbol{\widehat{\beta}}$, where $\lambda$ is a constant of our choice. At $\lambda=0$, this reduces to our original least squares regression. We can form our estimate, $\boldsymbol{\widehat{\beta}}=\left(\mathbf{X}^{T}\mathbf{X}+\lambda\mathbf{I}\right)^{-1}$. 
+
+Due to the introduction of the diagonal term, $\lambda\mathbf{I}$, ridge regression is more table than ordinary least squares regression, especially with multicollinear data (Hastie, Tibshirani & Friedman, 2001), which could be applicable here. We also note that there is a need to standardise the data due to the additional penalising term. We will make use of R's cv.glmnet function, which is in the glmnet library.
+```{r}
+#cv.glmnet requires us to convert our dataframe into a matrix
+X <- model.matrix(~0+country+mq1+mq2+hg+country+sex+category, data=Combined2012)
+Y <- data.matrix(Combined2012$score)
+
+#Alpha represents the way we penalise the coefficents, alpha=0 is what we require, alpha=1
+#penalises using the absolute value of the coefficients.
+myrr <- cv.glmnet(x=X, y=Y, alpha=0, standardize=TRUE, intercept=TRUE)
+```
+
+We can now look at the results of our ridge regression. We have the minimum mean cross-validation error out of all the lambda that was tried,
+```{r}
+min(myrr$cvm)
+```
+
+and we have the lambda that gave us this minimum,
+```{r}
+myrr$lambda.min
+```
+
+Unfortunately, we see that ridge regression did not improve our prediction by much at all!
+
+##K-Nearest Neighbours
+Lastly, we will be using the K-Nearest Neighbours (KNN) algorithm. KNN is a non-parametric method more frequently used as a classifier, but can function for regression as well. In our case, when we wish to predict the finals score of a bowler, we first measure the 'distance' between the predictor variables of the point we wish to predict, and all other points. Then, we find the scores of the K closest neighbours and use the mean as our prediction. Again, we will need to standardise the variables in order to prevent a single distance from dominating the others. We will use Euclidean distance for the continuous variables, and Hamming distance for the categorical vavriables.
+
+We first standardise our data,
+```{r, echo=FALSE}
+#Standardise the data
+Combined2012_standardised <- data.frame('country' = Combined2012$country, 
+  'mq1' = (Combined2012$mq1-mean(Combined2012$mq1))/sd(Combined2012$mq1),
+  'mq2' = (Combined2012$mq2-mean(Combined2012$mq2))/sd(Combined2012$mq2),
+  'hg' = (Combined2012$hg-mean(Combined2012$hg))/sd(Combined2012$hg),
+  'category'= Combined2012$category,
+  'sex' = Combined2012$sex,
+  'score' = Combined2012$score)
+
+head(Combined2012_standardised)
+```
+
+Now, we write a function to perform KNN regression for us,
+```{r}
+#We require a training dataset, a point to predict, and a value for K
+KNN.regress <- function (train, new, K){
+  #Calculate the difference between the continuous variables 
+  new_df <- data.frame('mq1' = new$mq1 - train$mq1,
+                       'mq2' = new$mq2 - train$mq2,
+                       'hg' = new$hg - train$hg)
+  dists <- sqrt(rowSums(new_df^2))
+  
+  #Add the difference between the categorical variables
+  dists <- dists + 
+            as.numeric(new$category != train$category) + 
+            as.numeric(new$sex != train$sex) +
+            as.numeric(new$country != train$country)
+  
+  #Sort the points and find the K closest points
+  neighbours  <- order(dists)[1:K]
+  #Return a prediction
+  pred <- mean(train$score[neighbours])
+  return(pred)
+}
+```
+
+We split our dataset for cross-validation using a solution provided by Drew (2014) and run our KNN.regress function. We will run the function for $K=1,\dots,10$ and see which gives us the lowest cross-validation error.
+```{r, echo=FALSE}
+K <- 10
+CVE <- rep(0,K)
+
+for (choice in 1:K){
+  #Error vector
+  error_vec <- rep(0,10)
+  
+  #Randomly shuffle the data
+  new_data<-Combined2012_standardised[sample(nrow(Combined2012_standardised)),]
+  
+  #Create 10 equally size folds
+  folds <- cut(seq(1,nrow(new_data)),breaks=10,labels=FALSE)
+  
+  #Perform 10 fold cross validation
+  for(i in 1:10){
+    #Segement your data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    testData <- new_data[testIndexes, ]
+    trainData <- new_data[-testIndexes, ]
+    
+    error <- 0
+    #Run KNN.regress for each point in testData
+    for (j in 1:nrow(testData)){
+      prediction <- KNN.regress(trainData, testData[j,], choice)
+      error <- error + (prediction - testData$score[j])^2
+    }
+    error_vec[i] <- error/nrow(testData)
+  }
+  CVE[choice] <- mean(error_vec)
+}
+
+plot(1:K, CVE, xlab='Number of nearest neighbours', ylab='Cross-validation error')
+lines(1:K, CVE)
+```  
+
+We can see from our plot that from around $K=6$ onwards, the cross-validation error reaches around 140 and does not change by much. Again, it does not seem that we can predict Masters scores with KNN regression.
+
+##Conclusion and Further Improvement
+While writing the code for this project, one way which I will look to improve on is trying to somehow automate the process through which I scraped the data from the ABF website, as doing it individually for each category was time-consuming and inefficient. I could have also provided some simple summary statistics and conduct hypothesis testing during the Exploratory Data Analysis to show that there is little to no correlation, but where's the fun in that!
+
+We note that the performance of all 3 methods seem to suggest that we cannot accurately predict a bowler's Masters scores from his/her MQ scores. This is actually in line with what most bowlers believe, that anybody has an equal chance of winning regardless of how high they qualified with. 
+
+More importantly, we should recognise that even if we could predict the scores, the way this small project was conducted is invalid. This is because all the Masters scores appear on the same day, which means that we will obtain the training data at the same time as the data for those that we wish to predict! The reason I did this project then, was to satisfy some internal curiosity within me whether it was possible to predict the scores at all (it isn't).
+
+A more realistic study could be to look at the qualifying and winning averages over the years, and using that try to predict the scores of the next year's tournament!
+
+##References
+1) Asian Bowling Federation. (2012, May). *45th Singapore International Open Youth Boys U-18 Qualifying*. Retrieved from http://www.abf-online.org/results/2012/45thspore-1.asp?Division=BU18.
+
+2) Goyvaerts, J. (2018, October). *Regular Expressions Quick Start*. Retrieved from https://www.regular-expressions.info/quickstart.html
+
+3) Hastie, T., Tibshirani, R., Friedman, J. (2001). *The Elements of Statistical Learning*. New York, NY, USA: Springer New York Inc.
+
+4) Jake Drew. (2014, July). *How to split a data set to do 10-fold cross validation*. Retrieved from https://stats.stackexchange.com/q/105839.
